@@ -1,368 +1,323 @@
 """
-桌面番茄钟 — 原生 Windows 桌面应用 (Python + tkinter)
-双击运行或命令行: python pomodoro.py
+桌面番茄钟 - Python tkinter 原生桌面应用
+专注/短休/长休三种模式，环形进度条，音效提醒，桌面通知
 """
-
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, simpledialog
 import math
+import time
 import json
+import os
 import threading
 import winsound
-from pathlib import Path
 
-# ── 配色 ──────────────────────────────────────────────────
-BG          = "#0f0f14"
-SURFACE     = "#1a1a24"
-SURFACE2    = "#252536"
-TEXT        = "#e8e8ed"
-TEXT_DIM    = "#8888a0"
-ACCENT      = "#ff6b6b"
-ACCENT_HI   = "#ff8787"
-BREAK_CLR   = "#4ecdc4"
-BREAK_HI    = "#6ee7de"
-RING_BG     = "#252536"
-DOT_EMPTY   = "#2a2a3a"
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pomodoro_settings.json")
+
+# 默认设置
+DEFAULTS = {
+    "focus": 25,
+    "short_break": 5,
+    "long_break": 15,
+    "always_on_top": True,
+    "theme": "light",
+}
+
+# 颜色方案
+LIGHT = {
+    "bg": "#f5f5f5",
+    "card": "#ffffff",
+    "text": "#2c3e50",
+    "subtext": "#95a5a6",
+    "ring_bg": "#e8e8e8",
+    "focus": "#e74c3c",
+    "short_break": "#27ae60",
+    "long_break": "#2980b9",
+    "btn_bg": "#e0e0e0",
+    "btn_active": "#d0d0d0",
+    "mode_bg": "#e0e0e0",
+    "mode_active": "#ffffff",
+    "divider": "#e0e0e0",
+}
+DARK = {
+    "bg": "#1a1a2e",
+    "card": "#16213e",
+    "text": "#e0e0e0",
+    "subtext": "#7f8c8d",
+    "ring_bg": "#2a2a4a",
+    "focus": "#e74c3c",
+    "short_break": "#2ecc71",
+    "long_break": "#3498db",
+    "btn_bg": "#2a2a4a",
+    "btn_active": "#3a3a5a",
+    "mode_bg": "#2a2a4a",
+    "mode_active": "#0f3460",
+    "divider": "#2a2a4a",
+}
+
+MODE_NAMES = {"focus": "专注", "short_break": "短休", "long_break": "长休"}
+MODE_COLORS = {"focus": "focus", "short_break": "short_break", "long_break": "long_break"}
 
 
 class PomodoroApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("番茄钟")
-        self.root.geometry("400x600")
-        self.root.configure(bg=BG)
-        self.root.resizable(False, False)
-        self.root.minsize(360, 540)
+        self.root.geometry("380x540")
+        self.root.minsize(340, 480)
+        self.root.resizable(True, True)
 
-        # 居中
-        self.root.update_idletasks()
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        w, h = 400, 600
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        # 加载设置
+        self.settings = self.load_settings()
+        self.theme = DARK if self.settings.get("theme") == "dark" else LIGHT
 
-        # ── 状态 ──────────────────────────────────────────
-        self.mode = "pomodoro"
+        # 状态
+        self.mode = "focus"
         self.running = False
-        self.paused = False
-        self.remaining = 25 * 60
-        self.total = 25 * 60
-        self.completed = 0
+        self.total_seconds = self.settings["focus"] * 60
+        self.remaining = self.total_seconds
+        self.completed_count = 0
         self.timer_id = None
-        self.half_notified = False
 
-        # ── 配置 ──────────────────────────────────────────
-        self.config_file = Path(__file__).parent / "pomodoro_config.json"
-        self.config = self._load_config()
+        # 应用颜色
+        self._colors = self.theme
+        self.root.configure(bg=self._colors["bg"])
 
-        # ── 构建界面 ──────────────────────────────────────
-        self._build_ui()
-        self._apply_mode()
+        # 置顶
+        if self.settings.get("always_on_top", True):
+            self.root.attributes("-topmost", True)
 
-        # ── 关闭事件 ──────────────────────────────────────
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.build_ui()
+        self.update_display()
+        self.center_window()
 
-    # ══════════════════════════════════════════════════════
-    # 配置读写
-    # ══════════════════════════════════════════════════════
+        # 窗口关闭时清理
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _load_config(self):
-        defaults = {
-            "pomodoro": 25, "shortBreak": 5,
-            "longBreak": 15, "longBreakInterval": 4,
-            "alwaysOnTop": False,
-        }
+    # ===== 设置持久化 =====
+    def load_settings(self):
         try:
-            if self.config_file.exists():
-                data = json.loads(self.config_file.read_text(encoding="utf-8"))
-                defaults.update(data)
-        except Exception:
-            pass
-        return defaults
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return {**DEFAULTS, **json.load(f)}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {**DEFAULTS}
 
-    def _save_config(self):
+    def save_settings(self):
         try:
-            self.config_file.write_text(
-                json.dumps(self.config, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False, indent=2)
+        except OSError:
             pass
 
-    # ══════════════════════════════════════════════════════
-    # UI 构建
-    # ══════════════════════════════════════════════════════
+    # ===== UI 构建 =====
+    def build_ui(self):
+        c = self._colors
 
-    def _build_ui(self):
-        container = tk.Frame(self.root, bg=BG)
-        container.pack(fill=tk.BOTH, expand=True, padx=28, pady=24)
+        # 主容器
+        self.main_frame = tk.Frame(self.root, bg=c["bg"])
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
 
-        # ── 模式切换标签 ──────────────────────────────────
-        tab_frame = tk.Frame(container, bg=SURFACE)
-        tab_frame.pack(fill=tk.X, pady=(0, 28))
-        tab_frame.grid_columnconfigure(0, weight=1)
-        tab_frame.grid_columnconfigure(1, weight=1)
-        tab_frame.grid_columnconfigure(2, weight=1)
+        # 顶部：主题和置顶按钮
+        top_bar = tk.Frame(self.main_frame, bg=c["bg"])
+        top_bar.pack(fill=tk.X)
 
-        self.tab_buttons = {}
-        modes = [("pomodoro", "专注"), ("shortBreak", "短休"), ("longBreak", "长休")]
-        for idx, (key, label) in enumerate(modes):
-            btn = tk.Button(
-                tab_frame, text=label,
-                font=("Microsoft YaHei UI", 11),
-                relief=tk.FLAT, borderwidth=0,
-                cursor="hand2", padx=16, pady=8,
-                command=lambda k=key: self._set_mode(k),
-            )
-            btn.grid(row=0, column=idx, sticky="ew", padx=2, pady=2)
-            self.tab_buttons[key] = btn
+        self.pin_btn = tk.Button(top_bar, text="📌" if self.settings.get("always_on_top", True) else "📍",
+                                 font=("", 12), bg=c["bg"], fg=c["text"], bd=0,
+                                 activebackground=c["bg"], cursor="hand2",
+                                 command=self.toggle_always_on_top)
+        self.pin_btn.pack(side=tk.LEFT)
 
-        # ── 环形进度 Canvas ───────────────────────────────
-        self.cv_size = 250
-        self.canvas = tk.Canvas(
-            container, width=self.cv_size, height=self.cv_size,
-            bg=BG, highlightthickness=0,
+        theme_text = "☀ 浅色" if self.settings.get("theme") == "dark" else "☾ 深色"
+        self.theme_btn = tk.Button(top_bar, text=theme_text, font=("", 10),
+                                    bg=c["bg"], fg=c["text"], bd=0,
+                                    activebackground=c["bg"], cursor="hand2",
+                                    command=self.toggle_theme)
+        self.theme_btn.pack(side=tk.RIGHT)
+
+        # 模式切换按钮
+        mode_frame = tk.Frame(self.main_frame, bg=c["mode_bg"])
+        mode_frame.pack(fill=tk.X, pady=(10, 16))
+        mode_frame.configure(relief=tk.FLAT)
+        # 用 tk.Frame 模拟圆角分段控件
+        inner = tk.Frame(mode_frame, bg=c["mode_bg"], bd=0)
+        inner.pack(padx=2, pady=2)
+
+        self.mode_buttons = {}
+        for key, label in [("focus", "🎯 专注"), ("short_break", "☕ 短休"), ("long_break", "🌿 长休")]:
+            btn = tk.Button(inner, text=label, font=("Microsoft YaHei UI", 10),
+                            bg=c["mode_bg"], fg=c["subtext"], bd=0,
+                            activebackground=c["mode_bg"], cursor="hand2",
+                            command=lambda m=key: self.switch_mode(m))
+            btn.pack(side=tk.LEFT, padx=1, pady=1, ipadx=10, ipady=4)
+            self.mode_buttons[key] = btn
+
+        # 环形进度条画布
+        self.canvas_size = 260
+        self.canvas = tk.Canvas(self.main_frame, width=self.canvas_size, height=self.canvas_size,
+                                bg=c["bg"], highlightthickness=0)
+        self.canvas.pack(pady=10)
+
+        # 中央计时文字
+        self.timer_text = self.canvas.create_text(
+            self.canvas_size / 2, self.canvas_size / 2,
+            text="25:00", font=("Consolas", 36, "bold"), fill=c["text"]
         )
-        self.canvas.pack(pady=(0, 8))
 
-        # 时间 / 状态文字
-        self.lbl_time = tk.Label(
-            self.canvas, text="25:00",
-            font=("Consolas", 46, "bold"),
-            fg=TEXT, bg=BG,
-        )
-        self.lbl_time.place(relx=0.5, rely=0.43, anchor=tk.CENTER)
+        # 模式标签
+        self.mode_label = tk.Label(self.main_frame, text="准备开始专注",
+                                   font=("Microsoft YaHei UI", 10), bg=c["bg"], fg=c["subtext"])
+        self.mode_label.pack(pady=(0, 12))
 
-        self.lbl_status = tk.Label(
-            self.canvas, text="准备开始",
-            font=("Microsoft YaHei UI", 10),
-            fg=TEXT_DIM, bg=BG,
-        )
-        self.lbl_status.place(relx=0.5, rely=0.62, anchor=tk.CENTER)
+        # 控制按钮
+        ctrl_frame = tk.Frame(self.main_frame, bg=c["bg"])
+        ctrl_frame.pack()
 
-        self._draw_ring(1.0)
+        self.reset_btn = tk.Button(ctrl_frame, text="↺", font=("", 16),
+                                   bg=c["btn_bg"], fg=c["text"], bd=0,
+                                   activebackground=c["btn_active"], cursor="hand2",
+                                   width=3, height=1, command=self.reset)
+        self.reset_btn.pack(side=tk.LEFT, padx=6)
 
-        # ── 控制按钮 ──────────────────────────────────────
-        ctrl = tk.Frame(container, bg=BG)
-        ctrl.pack(pady=(0, 20))
+        self.play_btn = tk.Button(ctrl_frame, text="▶", font=("", 20),
+                                  bg=c["focus"], fg="white", bd=0,
+                                  activebackground=c["focus"], cursor="hand2",
+                                  width=4, height=1, command=self.toggle_timer)
+        self.play_btn.pack(side=tk.LEFT, padx=6)
 
-        self.btn_reset = tk.Button(
-            ctrl, text="↻", font=("", 16),
-            relief=tk.FLAT, borderwidth=0, cursor="hand2",
-            fg=TEXT_DIM, bg=SURFACE,
-            activebackground=SURFACE2, activeforeground=TEXT,
-            width=3, height=1, command=self._reset,
-        )
-        self.btn_reset.pack(side=tk.LEFT, padx=6)
+        self.skip_btn = tk.Button(ctrl_frame, text="⏭", font=("", 16),
+                                  bg=c["btn_bg"], fg=c["text"], bd=0,
+                                  activebackground=c["btn_active"], cursor="hand2",
+                                  width=3, height=1, command=self.skip)
+        self.skip_btn.pack(side=tk.LEFT, padx=6)
 
-        self.btn_play = tk.Button(
-            ctrl, text="▶", font=("", 20),
-            relief=tk.FLAT, borderwidth=0, cursor="hand2",
-            fg="white", bg=ACCENT,
-            activebackground=ACCENT_HI, activeforeground="white",
-            width=3, height=1, command=self._toggle_play,
-        )
-        self.btn_play.pack(side=tk.LEFT, padx=6)
+        # 统计
+        stats_frame = tk.Frame(self.main_frame, bg=c["bg"])
+        stats_frame.pack(pady=(16, 5))
 
-        self.btn_skip = tk.Button(
-            ctrl, text="⏭", font=("", 16),
-            relief=tk.FLAT, borderwidth=0, cursor="hand2",
-            fg=TEXT_DIM, bg=SURFACE,
-            activebackground=SURFACE2, activeforeground=TEXT,
-            width=3, height=1, command=self._skip,
-        )
-        self.btn_skip.pack(side=tk.LEFT, padx=6)
+        self.today_label = tk.Label(stats_frame, text="今日 0 🍅", font=("Microsoft YaHei UI", 9),
+                                    bg=c["bg"], fg=c["subtext"])
+        self.today_label.pack(side=tk.LEFT, padx=12)
 
-        # ── 番茄计数圆点 ──────────────────────────────────
-        self.dots_canvas = tk.Canvas(
-            container, width=200, height=18,
-            bg=BG, highlightthickness=0,
-        )
-        self.dots_canvas.pack(pady=(0, 16))
-        self._update_dots()
+        self.total_label = tk.Label(stats_frame, text="总计 0 🍅", font=("Microsoft YaHei UI", 9),
+                                    bg=c["bg"], fg=c["subtext"])
+        self.total_label.pack(side=tk.LEFT, padx=12)
 
-        # ── 设置按钮 ──────────────────────────────────────
-        self.btn_settings = tk.Button(
-            container, text="⚙ 设置",
-            font=("Microsoft YaHei UI", 10),
-            fg=TEXT_DIM, bg=BG,
-            activeforeground=TEXT, activebackground=BG,
-            relief=tk.FLAT, cursor="hand2",
-            command=self._toggle_settings,
-        )
-        self.btn_settings.pack()
+        # 底部设置按钮
+        settings_btn = tk.Button(self.main_frame, text="⚙ 设置", font=("Microsoft YaHei UI", 9),
+                                 bg=c["bg"], fg=c["subtext"], bd=0,
+                                 activebackground=c["bg"], cursor="hand2",
+                                 command=self.open_settings)
+        settings_btn.pack(pady=(8, 0))
 
-        # ── 设置面板 ──────────────────────────────────────
-        self.settings_frame = tk.Frame(container, bg=SURFACE)
+        # 快捷键提示
+        hint = tk.Label(self.main_frame, text="空格 开始/暂停  |  R 重置  |  S 跳过",
+                        font=("Microsoft YaHei UI", 8), bg=c["bg"], fg=c["subtext"])
+        hint.pack(pady=(4, 0))
 
-        fields = [
-            ("专注时长 (分钟)", "pomodoro", 1, 120),
-            ("短休时长 (分钟)", "shortBreak", 1, 60),
-            ("长休时长 (分钟)", "longBreak", 1, 60),
-            ("长休间隔 (番茄数)", "longBreakInterval", 1, 10),
-        ]
-        self._spin_vars = {}
+        self.draw_ring(1.0)
+        self.bind_keys()
 
-        for label, key, lo, hi in fields:
-            row = tk.Frame(self.settings_frame, bg=SURFACE)
-            row.pack(fill=tk.X, padx=18, pady=5)
+    def bind_keys(self):
+        self.root.bind("<space>", lambda e: self.toggle_timer())
+        self.root.bind("<r>", lambda e: self.reset())
+        self.root.bind("<R>", lambda e: self.reset())
+        self.root.bind("<s>", lambda e: self.skip())
+        self.root.bind("<S>", lambda e: self.skip())
+        self.root.bind("<Configure>", self.on_resize)
 
-            tk.Label(
-                row, text=label, font=("Microsoft YaHei UI", 10),
-                fg=TEXT_DIM, bg=SURFACE,
-            ).pack(side=tk.LEFT)
-
-            var = tk.IntVar(value=self.config[key])
-            self._spin_vars[key] = var
-            var.trace_add("write", lambda *a, k=key: self._on_setting_change(k))
-
-            sp = tk.Spinbox(
-                row, textvariable=var, from_=lo, to=to,
-                width=6, font=("Consolas", 12),
-                fg=TEXT, bg=SURFACE2,
-                buttonbackground=SURFACE2,
-                relief=tk.FLAT, borderwidth=0,
-                justify=tk.CENTER, increment=1,
-                command=lambda k=key: self._on_setting_change(k),
-            )
-            sp.pack(side=tk.RIGHT)
-
-        # 置顶开关
-        row = tk.Frame(self.settings_frame, bg=SURFACE)
-        row.pack(fill=tk.X, padx=18, pady=5)
-        tk.Label(
-            row, text="窗口置顶", font=("Microsoft YaHei UI", 10),
-            fg=TEXT_DIM, bg=SURFACE,
-        ).pack(side=tk.LEFT)
-
-        self.top_var = tk.BooleanVar(value=self.config.get("alwaysOnTop", False))
-        cb = tk.Checkbutton(
-            row, variable=self.top_var,
-            bg=SURFACE, fg=TEXT,
-            activebackground=SURFACE, activeforeground=TEXT,
-            selectcolor=SURFACE2,
-            command=self._toggle_always_on_top,
-        )
-        cb.pack(side=tk.RIGHT)
-
-    # ══════════════════════════════════════════════════════
-    # 环形进度条
-    # ══════════════════════════════════════════════════════
-
-    def _draw_ring(self, ratio):
+    # ===== 环形进度条绘制 =====
+    def draw_ring(self, ratio):
+        """ratio: 0.0(空) ~ 1.0(满) 表示剩余比例"""
         self.canvas.delete("ring")
-        cx = cy = self.cv_size // 2
-        r = 115
-        sw = 7
+        c = self._colors
+        cx = self.canvas_size / 2
+        cy = self.canvas_size / 2
+        r = 105
+        width = 10
 
-        # 背景圆
-        self.canvas.create_oval(
-            cx - r, cy - r, cx + r, cy + r,
-            outline=RING_BG, width=sw,
-            tags="ring",
-        )
+        # 背景圆环
+        self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                outline=c["ring_bg"], width=width, tags="ring")
+        # 进度弧线（从顶部顺时针）
+        if ratio > 0.001:
+            angle = 360 * ratio
+            # tkinter 的 create_arc 从 3 点钟方向开始，start 是角度（逆时针为正）
+            # 我们要从 12 点（-90 度）开始，逆时针减少
+            start_angle = 90  # 12 点钟方向
+            extent = -angle    # 逆时针
+            color_key = MODE_COLORS[self.mode]
+            self.canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                                   start=start_angle, extent=extent,
+                                   outline=c[color_key], width=width,
+                                   style=tk.ARC, tags="ring")
 
-        if ratio <= 0:
-            return
+        # 更新中央文字
+        self.canvas.itemconfig(self.timer_text, fill=c["text"])
 
-        angle = 360 * ratio
-        color = ACCENT if self.mode == "pomodoro" else BREAK_CLR
-        # start=90 → 12 点钟方向, extent 为负 = 逆时针
-        self.canvas.create_arc(
-            cx - r, cy - r, cx + r, cy + r,
-            start=90, extent=-angle,
-            outline=color, width=sw,
-            style="arc", tags="ring",
-        )
+    def on_resize(self, event=None):
+        if self.canvas.winfo_width() > 50:
+            self.canvas_size = min(self.canvas.winfo_width(), self.canvas.winfo_height())
+            self.canvas.coords(self.timer_text, self.canvas_size / 2, self.canvas_size / 2)
+            ratio = self.remaining / self.total_seconds if self.total_seconds > 0 else 0
+            self.draw_ring(ratio)
 
-    # ══════════════════════════════════════════════════════
-    # 模式
-    # ══════════════════════════════════════════════════════
-
-    def _apply_mode(self):
-        mmap = {
-            "pomodoro": self.config["pomodoro"],
-            "shortBreak": self.config["shortBreak"],
-            "longBreak": self.config["longBreak"],
-        }
-        self.total = mmap[self.mode] * 60
-        self.remaining = self.total
-        self.half_notified = False
-
-        for key, btn in self.tab_buttons.items():
-            if key == self.mode:
-                btn.configure(bg=SURFACE2, fg=TEXT)
-            else:
-                btn.configure(bg=SURFACE, fg=TEXT_DIM)
-
-        self._update_display()
-        self._update_status()
-        self._update_dots()
-        self._update_play_button()
-
-    def _set_mode(self, mode):
+    # ===== 模式切换 =====
+    def switch_mode(self, mode):
         if self.running:
-            self._stop_timer()
+            if not messagebox.askokcancel("切换模式", f"计时器正在运行，确定切换到{MODE_NAMES[mode]}吗？"):
+                return
         self.mode = mode
-        self._apply_mode()
+        self.total_seconds = self.settings[mode] * 60
+        self.remaining = self.total_seconds
+        self.running = False
+        self._cancel_timer()
+        self.update_display()
+        self.update_mode_buttons()
 
-    # ══════════════════════════════════════════════════════
-    # 计时控制
-    # ══════════════════════════════════════════════════════
+    def update_mode_buttons(self):
+        c = self._colors
+        for key, btn in self.mode_buttons.items():
+            if key == self.mode:
+                btn.configure(bg=c["mode_active"], fg=c[MODE_COLORS[key]])
+            else:
+                btn.configure(bg=c["mode_bg"], fg=c["subtext"])
 
-    def _toggle_play(self):
+    # ===== 计时器逻辑 =====
+    def toggle_timer(self):
         if self.running:
-            self._pause()
+            self.pause()
         else:
-            self._start()
+            self.start()
 
-    def _start(self):
-        if self.running:
-            return
+    def start(self):
+        if self.remaining <= 0:
+            self.remaining = self.total_seconds
         self.running = True
-        self.paused = False
-        self._update_play_button()
-        self._update_status()
+        self.play_btn.configure(text="⏸", bg=self._colors[MODE_COLORS[self.mode]])
+        self.mode_label.configure(text=f"正在{MODE_NAMES[self.mode]}...")
         self._tick()
 
-    def _pause(self):
-        if not self.running:
-            return
+    def pause(self):
         self.running = False
-        self.paused = True
-        if self.timer_id:
-            self.root.after_cancel(self.timer_id)
-            self.timer_id = None
-        self._update_play_button()
-        self._update_status()
+        self.play_btn.configure(text="▶", bg=self._colors[MODE_COLORS[self.mode]])
+        self.mode_label.configure(text="已暂停")
+        self._cancel_timer()
 
-    def _stop_timer(self):
+    def reset(self):
         self.running = False
-        self.paused = False
-        if self.timer_id:
-            self.root.after_cancel(self.timer_id)
-            self.timer_id = None
+        self.remaining = self.total_seconds
+        self.play_btn.configure(text="▶", bg=self._colors[MODE_COLORS[self.mode]])
+        self.mode_label.configure(text=f"准备开始{MODE_NAMES[self.mode]}")
+        self._cancel_timer()
+        self.update_display()
 
-    def _reset(self):
-        self._stop_timer()
-        mmap = {
-            "pomodoro": self.config["pomodoro"],
-            "shortBreak": self.config["shortBreak"],
-            "longBreak": self.config["longBreak"],
-        }
-        self.total = mmap[self.mode] * 60
-        self.remaining = self.total
-        self.half_notified = False
-        self._update_play_button()
-        self._update_display()
-        self._update_status()
-
-    def _skip(self):
-        self._stop_timer()
-        self.remaining = 0
-        self._finish()
+    def skip(self):
+        self._cancel_timer()
+        self.running = False
+        self.play_btn.configure(text="▶", bg=self._colors[MODE_COLORS[self.mode]])
+        if self.mode == "focus":
+            self.switch_mode("short_break")
+        else:
+            self.switch_mode("focus")
 
     def _tick(self):
         if not self.running:
@@ -370,193 +325,244 @@ class PomodoroApp:
         if self.remaining <= 0:
             self._finish()
             return
-
         self.remaining -= 1
-        self._update_display()
-
-        if not self.half_notified and self.mode == "pomodoro":
-            if self.remaining <= self.total // 2:
-                self.half_notified = True
-                self._beep_async(660, 80)
-
+        self.update_display()
         self.timer_id = self.root.after(1000, self._tick)
 
+    def _cancel_timer(self):
+        if self.timer_id:
+            self.root.after_cancel(self.timer_id)
+            self.timer_id = None
+
     def _finish(self):
-        self._stop_timer()
+        self.running = False
+        self.play_btn.configure(text="▶", bg=self._colors[MODE_COLORS[self.mode]])
+        self._cancel_timer()
 
-        if self.mode == "pomodoro":
-            self.completed += 1
-            self._update_dots()
-            self._play_finish_sound()
-            self._show_toast("番茄时间到！", "专注结束，休息一下吧。")
-            if self.completed % self.config["longBreakInterval"] == 0:
-                self.mode = "longBreak"
-            else:
-                self.mode = "shortBreak"
+        # 播放音效
+        self._play_sound()
+
+        # 桌面通知弹窗
+        if self.mode == "focus":
+            msg = "专注时间结束！休息一下吧 ☕"
+            self.completed_count += 1
+            self._update_stats()
         else:
-            self._play_finish_sound()
-            self._show_toast("休息结束！", "准备开始新的番茄钟。")
-            self.mode = "pomodoro"
+            msg = "休息时间结束！开始新的专注吧 🎯"
 
-        self._apply_mode()
+        # 弹窗提醒
+        self.root.attributes("-topmost", True)
+        self.root.focus_force()
+        threading.Thread(target=self._show_notification, args=(msg,), daemon=True).start()
 
-    # ══════════════════════════════════════════════════════
-    # 界面更新
-    # ══════════════════════════════════════════════════════
-
-    def _update_display(self):
-        m, s = divmod(self.remaining, 60)
-        self.lbl_time.configure(text=f"{m:02d}:{s:02d}")
-        ratio = self.remaining / self.total if self.total > 0 else 0
-        self._draw_ring(ratio)
-        names = {"pomodoro": "专注", "shortBreak": "短休", "longBreak": "长休"}
-        self.root.title(f"{m:02d}:{s:02d} - {names[self.mode]} - 番茄钟")
-
-    def _update_status(self):
-        if self.running:
-            m = {"pomodoro": "专注中", "shortBreak": "休息中", "longBreak": "长休息中"}
-            self.lbl_status.configure(text=m[self.mode])
-        elif self.paused:
-            self.lbl_status.configure(text="已暂停")
-        else:
-            self.lbl_status.configure(text="准备开始")
-
-    def _update_play_button(self):
-        self.btn_play.configure(text="⏸" if self.running else "▶")
-
-    def _update_dots(self):
-        self.dots_canvas.delete("dot")
-        w = 200
-        h = 18
-        total = self.config["longBreakInterval"]
-        done = self.completed % total
-        spacing = w / (total + 1)
-        r = 6
-
-        for i in range(total):
-            x = spacing * (i + 1)
-            y = h / 2
-            if i < done:
-                color = ACCENT if self.mode == "pomodoro" else BREAK_CLR
+        # 自动切换模式
+        if self.mode == "focus":
+            if self.completed_count > 0 and self.completed_count % 4 == 0:
+                next_mode = "long_break"
             else:
-                color = DOT_EMPTY
-            self.dots_canvas.create_oval(
-                x - r, y - r, x + r, y + r,
-                fill=color, outline="",
-                tags="dot",
-            )
+                next_mode = "short_break"
+        else:
+            next_mode = "focus"
 
-    # ══════════════════════════════════════════════════════
-    # 音效
-    # ══════════════════════════════════════════════════════
+        self.switch_mode(next_mode)
 
-    def _beep_async(self, freq, ms):
+    def _play_sound(self):
+        """用 winsound 播放完成提示音"""
         try:
-            threading.Thread(target=lambda: winsound.Beep(freq, ms), daemon=True).start()
+            winsound.Beep(880, 150)
+            self.root.after(200, lambda: winsound.Beep(1100, 150))
+            self.root.after(400, lambda: winsound.Beep(1320, 300))
         except Exception:
             pass
 
-    def _play_finish_sound(self):
-        # 三连音
-        self.root.after(0, lambda: self._beep_async(880, 150))
-        self.root.after(160, lambda: self._beep_async(1100, 150))
-        self.root.after(320, lambda: self._beep_async(1320, 300))
+    def _show_notification(self, msg):
+        """临时弹窗提示"""
+        popup = tk.Toplevel(self.root)
+        popup.title("番茄钟")
+        popup.geometry("260x80")
+        popup.resizable(False, False)
+        popup.configure(bg=self._colors["card"])
+        popup.attributes("-topmost", True)
+        # 居中
+        popup.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 260) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 80) // 2
+        popup.geometry(f"+{x}+{y}")
 
-    # ══════════════════════════════════════════════════════
-    # Toast 弹窗
-    # ══════════════════════════════════════════════════════
+        tk.Label(popup, text=msg, font=("Microsoft YaHei UI", 11),
+                 bg=self._colors["card"], fg=self._colors["text"]).pack(expand=True)
+        tk.Button(popup, text="知道了", command=popup.destroy,
+                  font=("Microsoft YaHei UI", 9),
+                  bg=self._colors["focus"], fg="white", bd=0, padx=16, pady=2,
+                  cursor="hand2").pack(pady=(0, 12))
+        popup.focus_force()
 
-    def _show_toast(self, title, body):
-        toast = tk.Toplevel(self.root)
-        toast.title("")
-        toast.configure(bg=SURFACE)
-        toast.overrideredirect(True)
-        toast.attributes("-topmost", True)
+    # ===== 统计 =====
+    def _update_stats(self):
+        today_key = time.strftime("%Y-%m-%d")
+        stats = self.load_stats()
+        if stats.get("date") != today_key:
+            stats = {"date": today_key, "today": 0, "total": stats.get("total", 0)}
+        stats["today"] += 1
+        stats["total"] = stats.get("total", 0) + 1
+        self._save_stats(stats)
+        self.update_display()
 
+    def load_stats(self):
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pomodoro_stats.json")
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"date": "", "today": 0, "total": 0}
+
+    def _save_stats(self, stats):
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pomodoro_stats.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    # ===== UI 更新 =====
+    def update_display(self):
+        m = self.remaining // 60
+        s = self.remaining % 60
+        text = f"{m:02d}:{s:02d}"
+        self.canvas.itemconfig(self.timer_text, text=text)
+
+        ratio = self.remaining / self.total_seconds if self.total_seconds > 0 else 0
+        self.draw_ring(ratio)
+
+        # 更新标题
+        mode_name = MODE_NAMES[self.mode]
+        self.root.title(f"{text} - {mode_name} | 番茄钟")
+
+        # 更新统计
+        stats = self.load_stats()
+        self.today_label.configure(text=f"今日 {stats.get('today', 0)} 🍅")
+        self.total_label.configure(text=f"总计 {stats.get('total', 0)} 🍅")
+
+        # 播放按钮颜色
+        color_key = MODE_COLORS[self.mode]
+        self.play_btn.configure(bg=self._colors[color_key])
+
+    # ===== 主题 =====
+    def toggle_theme(self):
+        current = self.settings.get("theme", "light")
+        self.settings["theme"] = "dark" if current == "light" else "light"
+        self.save_settings()
+        self.theme = DARK if self.settings["theme"] == "dark" else LIGHT
+        self._colors = self.theme
+        self.root.configure(bg=self._colors["bg"])
+        self.main_frame.configure(bg=self._colors["bg"])
+        self.canvas.configure(bg=self._colors["bg"])
+        self.mode_label.configure(bg=self._colors["bg"], fg=self._colors["subtext"])
+        self.today_label.configure(bg=self._colors["bg"], fg=self._colors["subtext"])
+        self.total_label.configure(bg=self._colors["bg"], fg=self._colors["subtext"])
+        self.canvas.itemconfig(self.timer_text, fill=self._colors["text"])
+
+        theme_text = "☀ 浅色" if self.settings["theme"] == "dark" else "☾ 深色"
+        self.theme_btn.configure(text=theme_text, bg=self._colors["bg"], fg=self._colors["text"],
+                                  activebackground=self._colors["bg"])
+
+        self.update_mode_buttons()
+        self.reset()
+        self.update_display()
+
+        # 重建控制按钮外观
+        for btn in [self.reset_btn, self.skip_btn]:
+            btn.configure(bg=self._colors["btn_bg"], fg=self._colors["text"],
+                          activebackground=self._colors["btn_active"])
+        self.pin_btn.configure(bg=self._colors["bg"], fg=self._colors["text"],
+                               activebackground=self._colors["bg"])
+
+    def toggle_always_on_top(self):
+        current = self.settings.get("always_on_top", True)
+        self.settings["always_on_top"] = not current
+        self.save_settings()
+        self.root.attributes("-topmost", self.settings["always_on_top"])
+        self.pin_btn.configure(text="📌" if self.settings["always_on_top"] else "📍")
+
+    # ===== 设置窗口 =====
+    def open_settings(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("番茄钟设置")
+        dialog.geometry("300x240")
+        dialog.resizable(False, False)
+        dialog.configure(bg=self._colors["card"])
+        dialog.attributes("-topmost", True)
+        dialog.transient(self.root)
+
+        x = self.root.winfo_x() + (self.root.winfo_width() - 300) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 240) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        c = self._colors
+
+        tk.Label(dialog, text="时长设置（分钟）", font=("Microsoft YaHei UI", 11, "bold"),
+                 bg=c["card"], fg=c["text"]).pack(pady=(16, 12))
+
+        entries = {}
+        for key, label in [("focus", "专注"), ("short_break", "短休"), ("long_break", "长休")]:
+            row = tk.Frame(dialog, bg=c["card"])
+            row.pack(fill=tk.X, padx=30, pady=4)
+            tk.Label(row, text=f"  {label}", font=("Microsoft YaHei UI", 10),
+                     bg=c["card"], fg=c["text"]).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(self.settings[key]))
+            ent = tk.Entry(row, textvariable=var, font=("Consolas", 11),
+                           bg=c["ring_bg"] if "ring_bg" in c else c["btn_bg"],
+                           fg=c["text"], width=6, justify=tk.CENTER,
+                           insertbackground=c["text"], relief=tk.FLAT)
+            ent.pack(side=tk.RIGHT)
+            entries[key] = var
+
+        def save():
+            try:
+                for key, var in entries.items():
+                    val = int(var.get())
+                    if val < 1:
+                        val = 1
+                    if val > 120:
+                        val = 120
+                    self.settings[key] = val
+                    var.set(str(val))
+                self.save_settings()
+                if not self.running:
+                    self.total_seconds = self.settings[self.mode] * 60
+                    self.remaining = self.total_seconds
+                    self.update_display()
+                dialog.destroy()
+            except ValueError:
+                messagebox.showwarning("输入错误", "请输入有效的数字", parent=dialog)
+
+        tk.Button(dialog, text="保存", command=save,
+                  font=("Microsoft YaHei UI", 10),
+                  bg=c["focus"], fg="white", bd=0, padx=20, pady=4,
+                  activebackground=c["focus"], cursor="hand2").pack(pady=(12, 8))
+
+        dialog.grab_set()
+        dialog.focus_force()
+
+    # ===== 窗口管理 =====
+    def center_window(self):
         self.root.update_idletasks()
-        mx = self.root.winfo_x() + self.root.winfo_width() // 2
-        my = self.root.winfo_y() + self.root.winfo_height() // 2
-        toast.geometry(f"260x72+{mx - 130}+{my - 36}")
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.root.geometry(f"+{x}+{y}")
 
-        inner = tk.Frame(toast, bg=SURFACE, highlightbackground=SURFACE2, highlightthickness=1)
-        inner.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            inner, text=title, font=("Microsoft YaHei UI", 12, "bold"),
-            fg=TEXT, bg=SURFACE,
-        ).pack(pady=(12, 0))
-
-        tk.Label(
-            inner, text=body, font=("Microsoft YaHei UI", 9),
-            fg=TEXT_DIM, bg=SURFACE,
-        ).pack()
-
-        toast.after(2500, toast.destroy)
-
-    # ══════════════════════════════════════════════════════
-    # 设置操作
-    # ══════════════════════════════════════════════════════
-
-    def _toggle_settings(self):
-        if self.settings_frame.winfo_manager():
-            self.settings_frame.pack_forget()
-            self.btn_settings.configure(text="⚙ 设置")
-        else:
-            self.settings_frame.pack(fill=tk.X, pady=(12, 0), ipady=8)
-            self.btn_settings.configure(text="▲ 收起设置")
-            for key, var in self._spin_vars.items():
-                var.set(self.config[key])
-
-    def _on_setting_change(self, key):
-        val = self._spin_vars[key].get()
-        self.config[key] = val
-        self._save_config()
-
-        if not self.running:
-            mmap = {
-                "pomodoro": self.config["pomodoro"],
-                "shortBreak": self.config["shortBreak"],
-                "longBreak": self.config["longBreak"],
-            }
-            self.total = mmap[self.mode] * 60
-            self.remaining = self.total
-            self._update_display()
-            self._update_dots()
-
-    def _toggle_always_on_top(self):
-        is_top = self.top_var.get()
-        self.config["alwaysOnTop"] = is_top
-        self.root.attributes("-topmost", is_top)
-        self._save_config()
-
-    # ══════════════════════════════════════════════════════
-    # 键盘快捷键
-    # ══════════════════════════════════════════════════════
-
-    def _bind_keys(self):
-        self.root.bind("<space>", lambda e: self._toggle_play())
-        self.root.bind("<Key-r>", lambda e: self._reset())
-        self.root.bind("<Key-s>", lambda e: self._skip())
-        self.root.bind("<Key-1>", lambda e: self._set_mode("pomodoro"))
-        self.root.bind("<Key-2>", lambda e: self._set_mode("shortBreak"))
-        self.root.bind("<Key-3>", lambda e: self._set_mode("longBreak"))
-        self.root.bind("<Escape>", lambda e: self._on_close())
-
-    # ══════════════════════════════════════════════════════
-    # 生命周期
-    # ══════════════════════════════════════════════════════
-
-    def _on_close(self):
-        self._stop_timer()
-        self._save_config()
+    def on_close(self):
+        self._cancel_timer()
         self.root.destroy()
 
     def run(self):
-        if self.config.get("alwaysOnTop", False):
-            self.root.attributes("-topmost", True)
-        self._bind_keys()
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    PomodoroApp().run()
+    app = PomodoroApp()
+    app.run()

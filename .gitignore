@@ -1,2 +1,13 @@
-# 用户配置
-pomodoro_config.json
+# 系统文件
+Desktop.ini
+Thumbs.db
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
